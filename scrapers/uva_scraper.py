@@ -9,89 +9,109 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-UVA_BASE = 'https://www.uva.es'
+UVA_SEDE = 'https://sede.uva.es'
 
-EMPLOYMENT_URLS = [
-    f"{UVA_BASE}/export/sites/uva/6.vidauniversitaria/6.01.ofertaempleo/",
-    f"{UVA_BASE}/export/sites/uva/7.comunidaduniversitaria/7.09.tablondeanuncios/",
+# Categorías relevantes del tablón y sus slugs/totales aproximados
+# URL: /tablon/{slug}/1/0/{total}
+TABLON_CATEGORIES = [
+    ('ptgas', 'PTGAS'),
+    ('pdi', 'PDI'),
+    ('investigacion', 'Investigación'),
+]
+
+# Categorías extra que pueden tener convocatorias IT
+# También las categorías de la Sede electrónica de la UVa principal
+UVA_EXTRA_SOURCES = [
+    'https://www.uva.es/universidad/empleo-en-la-uva/',
 ]
 
 
 class UVaScraper(BaseScraper):
-    """Scraper para Universidad de Valladolid"""
+    """Scraper para Universidad de Valladolid (Sede Electrónica - Tablón)"""
 
     def __init__(self):
         super().__init__(
             source_name='Boletín UVa',
-            base_url=UVA_BASE
+            base_url=UVA_SEDE
         )
 
     def scrape(self):
-        """Extrae ofertas de empleo IT de las páginas de empleo de la UVa."""
+        """
+        Extrae ofertas de empleo IT del tablón de la Sede Electrónica de la UVa.
+        Accede a las categorías PTGAS y PDI del tablón para buscar convocatorias IT.
+        """
         jobs = []
 
         self.session.headers.update({
             'Accept-Language': 'es-ES,es;q=0.9',
             'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
-            'Referer': self.base_url
+            'Referer': UVA_SEDE
         })
 
         try:
-            logger.info(f"[{self.source_name}] Iniciando scraping...")
+            logger.info(f"[{self.source_name}] Iniciando scraping del tablón...")
 
             seen_urls = set()
 
-            for listing_url in EMPLOYMENT_URLS:
-                response = self.make_request(listing_url)
-                if not response:
-                    continue
+            for cat_slug, cat_name in TABLON_CATEGORIES:
+                # Acceder a las 3 primeras páginas de cada categoría (30 items más recientes)
+                for page in range(1, 4):
+                    url = f"{UVA_SEDE}/tablon/{cat_slug}/{page}/0/9999"
+                    response = self.make_request(url)
+                    if not response:
+                        break
 
-                soup = self.parse_html(response.content)
-                if not soup:
-                    continue
+                    soup = self.parse_html(response.content)
+                    if not soup:
+                        break
 
-                # Buscar todos los enlaces en la página
-                links = soup.find_all('a', href=True)
-                for link in links:
-                    href = link.get('href', '')
-                    text = link.get_text(strip=True)
+                    table = soup.find('table', id='ListadoAnuncios')
+                    if not table:
+                        break
 
-                    if not text or len(text) < 5:
-                        continue
+                    rows = table.find_all('tr')
+                    items_found_this_page = 0
 
-                    # Solo seguir links internos que parezcan convocatorias
-                    if not (href.startswith('/') or href.startswith(UVA_BASE)):
-                        continue
+                    for row in rows[1:]:  # Skip header
+                        cells = row.find_all('td')
+                        if len(cells) < 2:
+                            continue
 
-                    # Filtrar por keywords IT
-                    if not self.is_it_related(text, Config.IT_KEYWORDS):
-                        continue
+                        title_text = cells[0].get_text(' ', strip=True)
+                        date_text = cells[1].get_text(strip=True) if len(cells) > 1 else ''
+                        doc_links = cells[2].find_all('a', href=True) if len(cells) > 2 else []
 
-                    # Construir URL absoluta
-                    if href.startswith('/'):
-                        abs_url = f"{UVA_BASE}{href}"
-                    else:
-                        abs_url = href
+                        if not title_text or len(title_text) < 5:
+                            continue
 
-                    if abs_url in seen_urls:
-                        continue
-                    seen_urls.add(abs_url)
+                        items_found_this_page += 1
 
-                    # Intentar extraer fecha del contexto del listing (span/li adyacente)
-                    listing_date_str = None
-                    parent = link.parent
-                    if parent:
-                        parent_text = parent.get_text()
-                        date_match = re.search(
-                            r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', parent_text
-                        )
-                        if date_match:
-                            listing_date_str = date_match.group(1)
+                        # Filtrar por IT keywords
+                        if not self.is_it_related(title_text, Config.IT_KEYWORDS):
+                            continue
 
-                    self.delay(2)
-                    job = self.parse_uva_announcement(abs_url, listing_date_str)
-                    if job:
-                        jobs.append(job)
+                        # Obtener link al documento
+                        if not doc_links:
+                            continue
+                        doc_href = doc_links[0].get('href', '')
+                        abs_url = doc_href if doc_href.startswith('http') else f"{UVA_SEDE}{doc_href}"
+
+                        if abs_url in seen_urls:
+                            continue
+                        seen_urls.add(abs_url)
+
+                        # Parsear fecha
+                        publish_date = self.parse_spanish_date(date_text) or datetime.now().date()
+
+                        self.delay(2)
+                        job = self.parse_uva_announcement(abs_url, title_text, publish_date, cat_name)
+                        if job:
+                            jobs.append(job)
+
+                    # Si la página tiene pocas filas, no paginar más
+                    if items_found_this_page < 9:
+                        break
+                    self.delay(1)
 
         except Exception as e:
             logger.error(f"[{self.source_name}] Error durante scraping: {e}")
@@ -100,95 +120,63 @@ class UVaScraper(BaseScraper):
         self.log_scraping_result(len(jobs), len(jobs))
         return jobs
 
-    def parse_uva_announcement(self, announcement_url, listing_date_str=None):
-        """Parsea un anuncio de la UVa"""
+    def parse_uva_announcement(self, doc_url, title_fallback, publish_date, category_name='PTGAS'):
+        """
+        Parsea un documento del tablón de la UVa.
+        El documento es un PDF accesible en /documento-tablon/{uuid}.
+        """
         try:
-            response = self.make_request(announcement_url)
+            response = self.make_request(doc_url)
             if not response:
-                return None
+                return self._build_job(title_fallback, publish_date, doc_url, category_name)
 
-            soup = self.parse_html(response.content)
-            if not soup:
-                return None
+            content_type = response.headers.get('Content-Type', '').lower()
+            full_text = ''
 
-            # Título: buscar h1, luego h2
-            title = ''
-            for tag in ['h1', 'h2']:
-                t = soup.find(tag)
-                if t:
-                    title = t.get_text(strip=True)
-                    if title:
-                        break
+            if 'pdf' in content_type or doc_url.endswith('.pdf'):
+                try:
+                    from PyPDF2 import PdfReader
+                    import io
+                    reader = PdfReader(io.BytesIO(response.content))
+                    full_text = '\n'.join(page.extract_text() or '' for page in reader.pages)
+                except Exception as pdf_e:
+                    logger.warning(f"[{self.source_name}] Error leyendo PDF: {pdf_e}")
+            elif 'html' in content_type:
+                soup = self.parse_html(response.content)
+                if soup:
+                    full_text = soup.get_text(' ', strip=True)
 
-            if not title or len(title) < 5:
-                return None
+            if not full_text.strip():
+                return self._build_job(title_fallback, publish_date, doc_url, category_name)
 
-            # Fecha de publicación: buscar <th> con 'publicaci' y su <td> adyacente
-            publish_date = None
-            th_pub = soup.find('th', string=re.compile(r'publicaci', re.I))
-            if th_pub:
-                td = th_pub.find_next_sibling('td')
-                if td:
-                    publish_date = self.parse_spanish_date(td.get_text(strip=True))
+            lines = [l.strip() for l in full_text.splitlines() if l.strip()]
 
-            # Fallback: fecha del listing o del texto
-            if not publish_date and listing_date_str:
-                publish_date = self.parse_spanish_date(listing_date_str)
-            if not publish_date:
-                publish_date = datetime.now().date()
+            # Descripción: primeras líneas del documento
+            description = ' '.join(lines[:12])[:500] or title_fallback
 
-            # Deadline: buscar <th> con 'plazo' y su <td>
-            deadline = None
-            th_plazo = soup.find('th', string=re.compile(r'plazo', re.I))
-            if th_plazo:
-                td = th_plazo.find_next_sibling('td')
-                if td:
-                    deadline = self.parse_spanish_date(td.get_text(strip=True))
+            # Requisitos: buscar párrafo con titulación/requisitos
+            requirements = 'Ver convocatoria en sede.uva.es'
+            for line in lines:
+                if any(kw in line.lower() for kw in ['titulaci', 'requisito', 'grupo', 'subgrupo', 'ciclo formativo', 'grado superior']):
+                    requirements = line[:300]
+                    break
 
-            # Fallback deadline desde texto de la página
-            if not deadline:
-                full_text = soup.get_text()
-                deadline_str = extract_deadline_from_text(full_text)
-                if deadline_str:
-                    deadline = self.parse_spanish_date(deadline_str)
-
+            # Deadline: extraer del texto del PDF
+            deadline_str = extract_deadline_from_text(full_text)
+            deadline = self.parse_spanish_date(deadline_str) if deadline_str else None
             if not deadline or deadline < publish_date:
                 deadline = publish_date + timedelta(days=20)
 
-            # Localización: Valladolid por defecto, buscar campus
+            # Localización: Valladolid (con posibilidad de campus)
             location = 'Valladolid'
-            full_text = soup.get_text()
             campus_match = re.search(
-                r'\b(Palencia|Soria|Segovia|Valladolid)\b', full_text, re.I
+                r'\b(Palencia|Soria|Segovia)\b', full_text[:500], re.I
             )
             if campus_match:
                 location = campus_match.group(0).capitalize()
 
-            # Descripción
-            description = ''
-            desc_div = soup.select_one('.descripcion, .contenido-principal, #contenido, main')
-            if desc_div:
-                description = desc_div.get_text(strip=True)[:500]
-            if not description:
-                description = title
-
-            # Requisitos
-            requirements = ''
-            req_div = soup.select_one('.requisitos')
-            if req_div:
-                requirements = req_div.get_text(strip=True)[:300]
-            if not requirements:
-                # Buscar párrafo con palabras clave de requisitos
-                for p in soup.find_all('p'):
-                    p_text = p.get_text(strip=True)
-                    if any(kw in p_text.lower() for kw in ['titulaci', 'requisito', 'grupo', 'ciclo formativo']):
-                        requirements = p_text[:300]
-                        break
-            if not requirements:
-                requirements = 'Ver convocatoria oficial'
-
             return {
-                'title': title,
+                'title': title_fallback,
                 'source': self.source_name,
                 'organization': 'Universidad de Valladolid',
                 'location': location,
@@ -197,13 +185,28 @@ class UVaScraper(BaseScraper):
                 'category': 'Universidad',
                 'description': description,
                 'requirements': requirements,
-                'url': announcement_url
+                'url': doc_url
             }
 
         except Exception as e:
-            logger.error(f"[{self.source_name}] Error parseando anuncio {announcement_url}: {e}")
-            return None
+            logger.error(f"[{self.source_name}] Error parseando {doc_url}: {e}")
+            return self._build_job(title_fallback, publish_date, doc_url, category_name)
+
+    def _build_job(self, title, publish_date, url, category_name='PTGAS'):
+        """Construye un job básico solo con los datos del listado."""
+        return {
+            'title': title,
+            'source': self.source_name,
+            'organization': 'Universidad de Valladolid',
+            'location': 'Valladolid',
+            'publish_date': publish_date,
+            'deadline': publish_date + timedelta(days=20),
+            'category': 'Universidad',
+            'description': title,
+            'requirements': 'Ver convocatoria en sede.uva.es',
+            'url': url
+        }
 
     def scrape_research_jobs(self):
-        """Convocatorias de investigación (delegado a scrape() principal)"""
+        """Alias para compatibilidad - delegado a scrape()."""
         return []
